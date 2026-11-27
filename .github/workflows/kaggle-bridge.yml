@@ -172,7 +172,7 @@ jobs:
           PY
 
           echo "Submitting GPU kernel: $KERNEL_ID"
-          kaggle kernels push -p kernel
+          kaggle kernels push -p kernel --accelerator NvidiaTeslaT4
 
       - name: Wait for Kaggle execution
         shell: bash
