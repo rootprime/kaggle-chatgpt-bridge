@@ -1,0 +1,293 @@
+name: Kaggle Bridge - Wan 2.1 Video Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/kaggle-wan-video-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  wan-t4-video-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      KERNEL_SLUG: chatgpt-bridge-wan21-video-test
+
+    steps:
+      - name: Check credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$KAGGLE_USERNAME"
+          test -n "$KAGGLE_KEY"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Kaggle CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade kaggle six
+
+      - name: Configure Kaggle authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kaggle"
+          python - <<'PY'
+          import json, os
+          p = os.path.expanduser("~/.kaggle/kaggle.json")
+          with open(p, "w") as f:
+              json.dump({"username": os.environ["KAGGLE_USERNAME"],
+                         "key": os.environ["KAGGLE_KEY"]}, f)
+          os.chmod(p, 0o600)
+          PY
+
+      - name: Build and submit Wan 2.1 kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p kernel output
+          export KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+
+          python - <<'PY'
+          import json, os
+          metadata = {
+              "id": os.environ["KERNEL_ID"],
+              "title": "ChatGPT Bridge Wan 2.1 Video Test",
+              "code_file": "main.py",
+              "language": "python",
+              "kernel_type": "script",
+              "is_private": True,
+              "enable_gpu": True,
+              "enable_internet": True,
+              "dataset_sources": [],
+              "competition_sources": [],
+              "kernel_sources": [],
+              "model_sources": []
+          }
+          with open("kernel/kernel-metadata.json", "w") as f:
+              json.dump(metadata, f, indent=2)
+          PY
+
+          cat > kernel/main.py <<'PY'
+          import os, sys, json, time, platform, subprocess, traceback
+          from datetime import datetime, timezone
+
+          OUT = "/kaggle/working"
+          os.makedirs(OUT, exist_ok=True)
+          receipt = {
+              "status": "BOOTSTRAP",
+              "started_utc": datetime.now(timezone.utc).isoformat(),
+              "python": sys.version,
+              "platform": platform.platform(),
+              "model": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+              "task": "text-to-video",
+              "source_resolution": "832x480",
+              "frames": 49,
+              "fps": 8,
+              "output_format": "vertical 9:16 H.264"
+          }
+
+          def save_receipt():
+              with open(os.path.join(OUT, "wan_video_receipt.json"), "w") as f:
+                  json.dump(receipt, f, indent=2)
+
+          try:
+              import torch
+              receipt["torch"] = torch.__version__
+              receipt["cuda_available"] = torch.cuda.is_available()
+              if not torch.cuda.is_available():
+                  raise RuntimeError("CUDA unavailable in Kaggle kernel")
+              receipt["gpu_name"] = torch.cuda.get_device_name(0)
+              receipt["gpu_memory_gb"] = round(
+                  torch.cuda.get_device_properties(0).total_memory / 1024**3, 2
+              )
+              save_receipt()
+
+              subprocess.check_call([
+                  sys.executable, "-m", "pip", "install", "--quiet",
+                  "diffusers==0.35.2", "transformers==4.57.1",
+                  "accelerate==1.10.1", "imageio[ffmpeg]",
+                  "ftfy", "sentencepiece", "safetensors"
+              ])
+
+              from diffusers import WanPipeline
+              from diffusers.utils import export_to_video
+
+              torch.set_grad_enabled(False)
+              torch.backends.cuda.matmul.allow_tf32 = True
+              torch.cuda.reset_peak_memory_stats()
+              start = time.time()
+
+              model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+              pipe = WanPipeline.from_pretrained(
+                  model_id,
+                  torch_dtype=torch.float16
+              )
+              pipe.enable_model_cpu_offload()
+
+              prompt = (
+                  "Photorealistic premium science-fiction film shot, one compact "
+                  "humanoid service robot perfectly centered and fully visible from "
+                  "head to feet. The robot has a distinctive brushed titanium body, "
+                  "subtle amber optical eyes and precise mechanical joints. It takes "
+                  "several deliberate natural steps toward the camera through a "
+                  "richly detailed futuristic Tokyo street at blue hour after rain. "
+                  "Wet asphalt mirrors vivid cyan and amber signage, steam drifts "
+                  "from street vents, distant autonomous vehicles pass softly out "
+                  "of focus. Smooth low-angle backward tracking camera, maintaining "
+                  "the robot in the center of frame. Strong readable subject lighting, "
+                  "realistic metal reflections, cinematic contrast, atmospheric depth, "
+                  "high-end science-fiction cinematography, physically coherent motion."
+              )
+              negative = (
+                  "underexposed, nearly black, silhouette, static image, frozen motion, "
+                  "flicker, jitter, camera shake, malformed anatomy, extra limbs, "
+                  "duplicate robot, warped joints, deformed hands, blurry subject, "
+                  "washed out, flat lighting, text, subtitles, watermark, logo, "
+                  "cartoon, illustration, low resolution"
+              )
+
+              result = pipe(
+                  prompt=prompt,
+                  negative_prompt=negative,
+                  num_frames=49,
+                  height=480,
+                  width=832,
+                  num_inference_steps=30,
+                  guidance_scale=6.0,
+                  generator=torch.Generator(device="cuda").manual_seed(20261128)
+              )
+              frames = result.frames[0]
+              raw_path = os.path.join(OUT, "wan_robot_source.mp4")
+              final_path = os.path.join(OUT, "wan_robot_vertical_short.mp4")
+              export_to_video(frames, raw_path, fps=8)
+
+              ffmpeg = subprocess.check_output(
+                  [sys.executable, "-c",
+                   "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"],
+                  text=True
+              ).strip()
+              subprocess.check_call([
+                  ffmpeg, "-y", "-i", raw_path,
+                  "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+                  "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+                  "-pix_fmt", "yuv420p", "-movflags", "+faststart", final_path
+              ])
+
+              probe = subprocess.check_output([
+                  "ffprobe", "-v", "error", "-show_entries",
+                  "format=duration,size:stream=codec_name,width,height,nb_frames",
+                  "-of", "json", final_path
+              ], text=True)
+
+              size_bytes = os.path.getsize(final_path)
+              if size_bytes < 150000:
+                  raise RuntimeError(
+                      f"Encoded video is suspiciously small: {size_bytes} bytes"
+                  )
+
+              receipt.update({
+                  "status": "WAN_GENERATION_SUCCESS",
+                  "inference_seconds": round(time.time() - start, 2),
+                  "frames_generated": len(frames),
+                  "video_bytes": size_bytes,
+                  "ffprobe": json.loads(probe),
+                  "peak_gpu_memory_gb": round(
+                      torch.cuda.max_memory_allocated() / 1024**3, 2
+                  ),
+                  "finished_utc": datetime.now(timezone.utc).isoformat()
+              })
+              save_receipt()
+              print("WAN_VIDEO_TEST_RECEIPT")
+              print(json.dumps(receipt, indent=2))
+
+          except Exception as exc:
+              receipt.update({
+                  "status": "WAN_GENERATION_FAILED",
+                  "error": repr(exc),
+                  "traceback": traceback.format_exc(),
+                  "finished_utc": datetime.now(timezone.utc).isoformat()
+              })
+              save_receipt()
+              print(json.dumps(receipt, indent=2))
+              raise
+          PY
+
+          kaggle kernels push -p kernel --accelerator NvidiaTeslaT4
+
+      - name: Wait for Kaggle video generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+          completed=false
+
+          for i in $(seq 1 360); do
+            echo "Kaggle Wan video status check $i/360"
+            status="$(kaggle kernels status "$KERNEL_ID" 2>&1)" || true
+            echo "$status"
+
+            if echo "$status" | grep -Eqi 'COMPLETE'; then
+              completed=true
+              break
+            fi
+
+            if echo "$status" | grep -Eqi 'ERROR|CANCEL'; then
+              echo "Kaggle execution failed; retrieving kernel logs."
+              mkdir -p output
+              kaggle kernels logs "$KERNEL_ID" > output/kaggle-wan-kernel.log 2>&1 || true
+              cat output/kaggle-wan-kernel.log
+              exit 1
+            fi
+            sleep 30
+          done
+
+          if [ "$completed" != "true" ]; then
+            echo "Timed out waiting for Kaggle Wan generation."
+            mkdir -p output
+            kaggle kernels logs "$KERNEL_ID" > output/kaggle-wan-kernel.log 2>&1 || true
+            exit 1
+          fi
+
+      - name: Retrieve video and receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+          mkdir -p output
+          kaggle kernels output "$KERNEL_ID" -p output
+          test -s output/wan_video_receipt.json
+          cat output/wan_video_receipt.json
+          python - <<'PY'
+          import json, os
+          with open("output/wan_video_receipt.json") as f:
+              data = json.load(f)
+          if data.get("status") != "WAN_GENERATION_SUCCESS":
+              raise SystemExit("Wan generation failed: " + str(data.get("status")))
+          if not os.path.exists("output/wan_robot_vertical_short.mp4"):
+              raise SystemExit("Expected vertical MP4 is missing")
+          PY
+
+      - name: Upload video, receipt, and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-wan21-robot-short
+          path: |
+            output/wan_robot_vertical_short.mp4
+            output/wan_video_receipt.json
+            output/kaggle-wan-kernel.log
+          if-no-files-found: ignore
+          retention-days: 14
+          compression-level: 0
+          
