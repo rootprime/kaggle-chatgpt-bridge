@@ -1,16 +1,20 @@
 
-name: Kaggle Bridge - First Execution
+name: Kaggle Bridge - GPU Verification
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/kaggle-bridge.yml"
 
 permissions:
   contents: read
 
 jobs:
-  kaggle-probe:
+  kaggle-gpu-probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
 
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
@@ -18,21 +22,12 @@ jobs:
       KERNEL_SLUG: chatgpt-bridge-connection-probe
 
     steps:
-      - name: Check credentials exist
+      - name: Check credentials
         shell: bash
         run: |
           set -euo pipefail
-
-          test -n "$KAGGLE_USERNAME" || {
-            echo "Missing KAGGLE_USERNAME secret"
-            exit 1
-          }
-
-          test -n "$KAGGLE_KEY" || {
-            echo "Missing KAGGLE_KEY secret"
-            exit 1
-          }
-
+          test -n "$KAGGLE_USERNAME"
+          test -n "$KAGGLE_KEY"
           echo "Kaggle credentials are present."
 
       - name: Set up Python
@@ -49,47 +44,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p "$HOME/.kaggle"
 
           python - <<'PY'
-          import json
-          import os
-
+          import json, os
           path = os.path.expanduser("~/.kaggle/kaggle.json")
-
           with open(path, "w") as f:
               json.dump({
                   "username": os.environ["KAGGLE_USERNAME"],
                   "key": os.environ["KAGGLE_KEY"]
               }, f)
-
           os.chmod(path, 0o600)
           PY
 
-          echo "Kaggle authentication configured."
-
-      - name: Create Kaggle probe kernel
+      - name: Create and submit GPU benchmark
         shell: bash
         run: |
           set -euo pipefail
-
           mkdir -p kernel output
-
           export KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
 
           python - <<'PY'
-          import json
-          import os
+          import json, os
 
           metadata = {
               "id": os.environ["KERNEL_ID"],
-              "title": "ChatGPT Bridge Connection Probe",
+              "title": "ChatGPT Bridge GPU Verification",
               "code_file": "main.py",
               "language": "python",
               "kernel_type": "script",
               "is_private": True,
-              "enable_gpu": False,
+              "enable_gpu": True,
               "enable_internet": False,
               "dataset_sources": [],
               "competition_sources": [],
@@ -100,7 +85,6 @@ jobs:
           with open("kernel/kernel-metadata.json", "w") as f:
               json.dump(metadata, f, indent=2)
 
-          print("Kernel metadata:")
           print(json.dumps(metadata, indent=2))
           PY
 
@@ -108,43 +92,86 @@ jobs:
           import json
           import os
           import platform
-          import socket
           import sys
+          import time
           from datetime import datetime, timezone
 
           result = {
-              "status": "KAGGLE_EXECUTION_SUCCESS",
+              "status": "GPU_PROBE_STARTED",
               "timestamp_utc": datetime.now(timezone.utc).isoformat(),
               "python": sys.version,
               "platform": platform.platform(),
               "machine": platform.machine(),
-              "cpu_count": os.cpu_count(),
-              "hostname": socket.gethostname()
+              "cpu_count": os.cpu_count()
           }
 
-          try:
-              import torch
+          import torch
 
-              result["pytorch"] = torch.__version__
-              result["cuda_available"] = torch.cuda.is_available()
+          result["pytorch"] = torch.__version__
+          result["cuda_available"] = torch.cuda.is_available()
 
-              if torch.cuda.is_available():
-                  result["gpu"] = torch.cuda.get_device_name(0)
+          if not torch.cuda.is_available():
+              result["status"] = "GPU_UNAVAILABLE"
+              result["error"] = "CUDA is not available."
+              os.makedirs("/kaggle/working", exist_ok=True)
+              with open("/kaggle/working/bridge_receipt.json", "w") as f:
+                  json.dump(result, f, indent=2)
+              print(json.dumps(result, indent=2))
+              raise RuntimeError(result["error"])
 
-          except Exception as e:
-              result["pytorch_check"] = str(e)
+          device = torch.device("cuda:0")
+          props = torch.cuda.get_device_properties(device)
+
+          result["gpu_name"] = torch.cuda.get_device_name(device)
+          result["gpu_total_memory_bytes"] = props.total_memory
+          result["gpu_capability"] = list(
+              torch.cuda.get_device_capability(device)
+          )
+
+          # Warm-up
+          n = 2048
+          a = torch.randn((n, n), device=device)
+          b = torch.randn((n, n), device=device)
+
+          for _ in range(3):
+              c = torch.matmul(a, b)
+
+          torch.cuda.synchronize()
+
+          # Benchmark
+          iterations = 20
+          start = time.perf_counter()
+
+          for _ in range(iterations):
+              c = torch.matmul(a, b)
+
+          torch.cuda.synchronize()
+          elapsed = time.perf_counter() - start
+
+          result.update({
+              "status": "KAGGLE_GPU_EXECUTION_SUCCESS",
+              "benchmark": "FP32 matrix multiplication",
+              "matrix_size": n,
+              "iterations": iterations,
+              "elapsed_seconds": round(elapsed, 4),
+              "average_seconds_per_iteration": round(
+                  elapsed / iterations, 6
+              ),
+              "result_checksum": float(c[0, 0].item()),
+              "peak_memory_allocated_bytes":
+                  torch.cuda.max_memory_allocated(device)
+          })
 
           os.makedirs("/kaggle/working", exist_ok=True)
 
           with open("/kaggle/working/bridge_receipt.json", "w") as f:
               json.dump(result, f, indent=2)
 
-          print("BRIDGE_EXECUTION_RECEIPT")
+          print("BRIDGE_GPU_RECEIPT")
           print(json.dumps(result, indent=2))
           PY
 
-          echo "Submitting Kaggle kernel: $KERNEL_ID"
-
+          echo "Submitting GPU kernel: $KERNEL_ID"
           kaggle kernels push -p kernel
 
       - name: Wait for Kaggle execution
@@ -155,35 +182,29 @@ jobs:
           KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
           completed=false
 
-          echo "Waiting for Kaggle kernel: $KERNEL_ID"
-
-          for i in $(seq 1 30); do
-            echo "Status check $i/30"
+          for i in $(seq 1 60); do
+            echo "GPU status check $i/60"
 
             if status="$(kaggle kernels status "$KERNEL_ID" 2>&1)"; then
               echo "$status"
             else
               echo "$status"
 
-              if echo "$status" | grep -Eqi 'permission|not found|404|unauthorized'; then
-                echo "Kaggle rejected access to this kernel."
-                echo "Check the kernel ID and Kaggle account ownership."
+              if echo "$status" | grep -Eqi \
+                'permission|not found|404|unauthorized'; then
                 exit 1
               fi
 
-              echo "Temporary status error. Retrying..."
               sleep 30
               continue
             fi
 
             if echo "$status" | grep -Eqi 'COMPLETE'; then
               completed=true
-              echo "Kaggle execution completed."
               break
             fi
 
             if echo "$status" | grep -Eqi 'ERROR|CANCEL'; then
-              echo "Kaggle kernel execution failed."
               exit 1
             fi
 
@@ -191,32 +212,45 @@ jobs:
           done
 
           if [ "$completed" != "true" ]; then
-            echo "Timed out waiting for Kaggle execution."
+            echo "Timed out waiting for Kaggle GPU execution."
             exit 1
           fi
 
-      - name: Retrieve Kaggle result
+      - name: Retrieve and validate GPU receipt
         shell: bash
         run: |
           set -euo pipefail
 
           KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
-
           mkdir -p output
 
-          echo "Downloading execution receipt..."
-
           kaggle kernels output "$KERNEL_ID" -p output
-
           test -s output/bridge_receipt.json
 
-          echo "Execution receipt retrieved:"
           cat output/bridge_receipt.json
 
-      - name: Save execution receipt
+          python - <<'PY'
+          import json
+
+          with open("output/bridge_receipt.json") as f:
+              data = json.load(f)
+
+          if data.get("status") != "KAGGLE_GPU_EXECUTION_SUCCESS":
+              raise SystemExit(
+                  "GPU verification failed: " +
+                  str(data.get("status"))
+              )
+
+          if not data.get("cuda_available"):
+              raise SystemExit("CUDA was not available.")
+
+          print("GPU verification passed:", data.get("gpu_name"))
+          PY
+
+      - name: Save GPU execution receipt
         uses: actions/upload-artifact@v4
         with:
-          name: kaggle-bridge-proof
+          name: kaggle-gpu-proof
           path: output/bridge_receipt.json
           if-no-files-found: error
-          retention-days: 
+          retention-days: 14
