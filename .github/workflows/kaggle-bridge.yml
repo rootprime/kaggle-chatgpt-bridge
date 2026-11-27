@@ -15,20 +15,24 @@ jobs:
     env:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      KERNEL_SLUG: chatgpt-bridge-connection-probe
 
     steps:
       - name: Check credentials exist
         shell: bash
         run: |
           set -euo pipefail
+
           test -n "$KAGGLE_USERNAME" || {
             echo "Missing KAGGLE_USERNAME secret"
             exit 1
           }
+
           test -n "$KAGGLE_KEY" || {
             echo "Missing KAGGLE_KEY secret"
             exit 1
           }
+
           echo "Kaggle credentials are present."
 
       - name: Set up Python
@@ -45,28 +49,39 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "$HOME/.kaggle"
+
           python - <<'PY'
-          import json, os
-          p = os.path.expanduser("~/.kaggle/kaggle.json")
-          with open(p, "w") as f:
+          import json
+          import os
+
+          path = os.path.expanduser("~/.kaggle/kaggle.json")
+
+          with open(path, "w") as f:
               json.dump({
                   "username": os.environ["KAGGLE_USERNAME"],
                   "key": os.environ["KAGGLE_KEY"]
               }, f)
-          os.chmod(p, 0o600)
+
+          os.chmod(path, 0o600)
           PY
+
+          echo "Kaggle authentication configured."
 
       - name: Create Kaggle probe kernel
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p kernel output
 
-          export KERNEL_ID="${KAGGLE_USERNAME}/chatgpt-bridge-probe"
+          export KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
 
           python - <<'PY'
-          import json, os
+          import json
+          import os
+
           metadata = {
               "id": os.environ["KERNEL_ID"],
               "title": "ChatGPT Bridge Connection Probe",
@@ -81,8 +96,12 @@ jobs:
               "kernel_sources": [],
               "model_sources": []
           }
+
           with open("kernel/kernel-metadata.json", "w") as f:
               json.dump(metadata, f, indent=2)
+
+          print("Kernel metadata:")
+          print(json.dumps(metadata, indent=2))
           PY
 
           cat > kernel/main.py <<'PY'
@@ -105,46 +124,66 @@ jobs:
 
           try:
               import torch
+
               result["pytorch"] = torch.__version__
               result["cuda_available"] = torch.cuda.is_available()
+
               if torch.cuda.is_available():
                   result["gpu"] = torch.cuda.get_device_name(0)
+
           except Exception as e:
               result["pytorch_check"] = str(e)
 
           os.makedirs("/kaggle/working", exist_ok=True)
+
           with open("/kaggle/working/bridge_receipt.json", "w") as f:
               json.dump(result, f, indent=2)
 
+          print("BRIDGE_EXECUTION_RECEIPT")
           print(json.dumps(result, indent=2))
           PY
 
-          echo "Kernel prepared: $KERNEL_ID"
+          echo "Submitting Kaggle kernel: $KERNEL_ID"
+
           kaggle kernels push -p kernel
 
       - name: Wait for Kaggle execution
         shell: bash
         run: |
           set -euo pipefail
-          KERNEL_ID="${KAGGLE_USERNAME}/chatgpt-bridge-probe"
+
+          KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
           completed=false
 
+          echo "Waiting for Kaggle kernel: $KERNEL_ID"
+
           for i in $(seq 1 30); do
-            echo "Kaggle status check $i/30"
-            status="$(kaggle kernels status "$KERNEL_ID" 2>&1)" || {
+            echo "Status check $i/30"
+
+            if status="$(kaggle kernels status "$KERNEL_ID" 2>&1)"; then
               echo "$status"
+            else
+              echo "$status"
+
+              if echo "$status" | grep -Eqi 'permission|not found|404|unauthorized'; then
+                echo "Kaggle rejected access to this kernel."
+                echo "Check the kernel ID and Kaggle account ownership."
+                exit 1
+              fi
+
+              echo "Temporary status error. Retrying..."
               sleep 30
               continue
-            }
-            echo "$status"
+            fi
 
             if echo "$status" | grep -Eqi 'COMPLETE'; then
               completed=true
+              echo "Kaggle execution completed."
               break
             fi
 
             if echo "$status" | grep -Eqi 'ERROR|CANCEL'; then
-              echo "Kaggle kernel failed."
+              echo "Kaggle kernel execution failed."
               exit 1
             fi
 
@@ -152,7 +191,7 @@ jobs:
           done
 
           if [ "$completed" != "true" ]; then
-            echo "Timed out waiting for Kaggle."
+            echo "Timed out waiting for Kaggle execution."
             exit 1
           fi
 
@@ -160,9 +199,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          KERNEL_ID="${KAGGLE_USERNAME}/chatgpt-bridge-probe"
+
+          KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+
+          mkdir -p output
+
+          echo "Downloading execution receipt..."
+
           kaggle kernels output "$KERNEL_ID" -p output
+
           test -s output/bridge_receipt.json
+
+          echo "Execution receipt retrieved:"
           cat output/bridge_receipt.json
 
       - name: Save execution receipt
@@ -171,5 +219,4 @@ jobs:
           name: kaggle-bridge-proof
           path: output/bridge_receipt.json
           if-no-files-found: error
-          retention-days: 7
-          
+          retention-days: 
