@@ -205,6 +205,10 @@ jobs:
             fi
 
             if echo "$status" | grep -Eqi 'ERROR|CANCEL'; then
+              echo "Kaggle execution failed. Retrieving kernel logs..."
+              mkdir -p output
+              kaggle kernels logs "$KERNEL_ID" > output/kaggle-kernel.log 2>&1 || true
+              cat output/kaggle-kernel.log
               exit 1
             fi
 
@@ -253,4 +257,12 @@ jobs:
           name: kaggle-gpu-proof
           path: output/bridge_receipt.json
           if-no-files-found: error
+          retention-days: 14
+      - name: Save Kaggle diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-gpu-diagnostics
+          path: output/kaggle-kernel.log
+          if-no-files-found: ignore
           retention-days: 14
