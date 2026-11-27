@@ -69,7 +69,7 @@ jobs:
 
           metadata = {
               "id": os.environ["KERNEL_ID"],
-              "title": "ChatGPT Bridge GPU Verification",
+              "title": "ChatGPT Bridge Connection Probe",
               "code_file": "main.py",
               "language": "python",
               "kernel_type": "script",
