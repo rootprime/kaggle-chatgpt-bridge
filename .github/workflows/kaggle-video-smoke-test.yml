@@ -1,0 +1,265 @@
+name: Kaggle Bridge - AI Video Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/kaggle-video-smoke-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  cogvideox-t4-smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      KERNEL_SLUG: chatgpt-bridge-cogvideox-smoke-test
+
+    steps:
+      - name: Check credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$KAGGLE_USERNAME"
+          test -n "$KAGGLE_KEY"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Kaggle CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade kaggle
+
+      - name: Configure Kaggle authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.kaggle"
+          python - <<'PY'
+          import json, os
+          p = os.path.expanduser("~/.kaggle/kaggle.json")
+          with open(p, "w") as f:
+              json.dump({"username": os.environ["KAGGLE_USERNAME"],
+                         "key": os.environ["KAGGLE_KEY"]}, f)
+          os.chmod(p, 0o600)
+          PY
+
+      - name: Build and submit CogVideoX kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p kernel output
+          export KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+
+          python - <<'PY'
+          import json, os
+          metadata = {
+              "id": os.environ["KERNEL_ID"],
+              "title": "ChatGPT Bridge CogVideoX Smoke Test",
+              "code_file": "main.py",
+              "language": "python",
+              "kernel_type": "script",
+              "is_private": True,
+              "enable_gpu": True,
+              "enable_internet": True,
+              "dataset_sources": [],
+              "competition_sources": [],
+              "kernel_sources": [],
+              "model_sources": []
+          }
+          with open("kernel/kernel-metadata.json", "w") as f:
+              json.dump(metadata, f, indent=2)
+          PY
+
+          cat > kernel/main.py <<'PY'
+          import os, sys, json, time, platform, subprocess, traceback
+          from datetime import datetime, timezone
+
+          OUT = "/kaggle/working"
+          os.makedirs(OUT, exist_ok=True)
+          receipt = {
+              "status": "BOOTSTRAP",
+              "started_utc": datetime.now(timezone.utc).isoformat(),
+              "python": sys.version,
+              "platform": platform.platform(),
+              "model": "THUDM/CogVideoX-2b",
+              "task": "text-to-video",
+              "resolution": "720x480",
+              "frames": 49,
+              "fps": 8
+          }
+
+          def save_receipt():
+              with open(os.path.join(OUT, "video_test_receipt.json"), "w") as f:
+                  json.dump(receipt, f, indent=2)
+
+          try:
+              import torch
+              receipt["torch"] = torch.__version__
+              receipt["cuda_available"] = torch.cuda.is_available()
+              if not torch.cuda.is_available():
+                  raise RuntimeError("CUDA unavailable in Kaggle kernel")
+              receipt["gpu_name"] = torch.cuda.get_device_name(0)
+              receipt["gpu_memory_gb"] = round(
+                  torch.cuda.get_device_properties(0).total_memory / 1024**3, 2
+              )
+              save_receipt()
+
+              subprocess.check_call([
+                  sys.executable, "-m", "pip", "install", "--quiet",
+                  "diffusers==0.35.2", "transformers==4.57.1",
+                  "accelerate==1.10.1", "imageio-ffmpeg==0.6.0",
+                  "sentencepiece", "safetensors"
+              ])
+
+              from diffusers import CogVideoXPipeline
+              from diffusers.utils import export_to_video
+
+              torch.set_grad_enabled(False)
+              torch.backends.cuda.matmul.allow_tf32 = True
+              start = time.time()
+
+              pipe = CogVideoXPipeline.from_pretrained(
+                  "THUDM/CogVideoX-2b",
+                  torch_dtype=torch.float16,
+                  use_safetensors=True
+              )
+              pipe.enable_sequential_cpu_offload()
+              pipe.vae.enable_slicing()
+              pipe.vae.enable_tiling()
+
+              prompt = (
+                  "A premium cinematic science-fiction shot of a compact humanoid "
+                  "service robot walking through a rain-soaked neon-lit future city "
+                  "street at night. Smooth side-tracking camera, reflections shimmer "
+                  "on wet pavement, intricate brushed-metal surfaces, atmospheric "
+                  "volumetric lighting, coherent natural movement, photorealistic "
+                  "film cinematography."
+              )
+              negative = (
+                  "flicker, jitter, unstable geometry, duplicate limbs, warped hands, "
+                  "text, subtitles, watermark, low detail, blur, distorted body"
+              )
+
+              result = pipe(
+                  prompt=prompt,
+                  negative_prompt=negative,
+                  num_frames=49,
+                  height=480,
+                  width=720,
+                  num_inference_steps=30,
+                  guidance_scale=6.0,
+                  generator=torch.Generator(device="cuda").manual_seed(20261127)
+              )
+
+              frames = result.frames[0]
+              video_path = os.path.join(OUT, "cogvideox_robot_smoke_test.mp4")
+              export_to_video(frames, video_path, fps=8)
+
+              probe = subprocess.check_output([
+                  "ffprobe", "-v", "error", "-show_entries",
+                  "format=duration,size:stream=codec_name,width,height,nb_frames",
+                  "-of", "json", video_path
+              ], text=True)
+
+              receipt.update({
+                  "status": "COGVIDEOX_GENERATION_SUCCESS",
+                  "inference_seconds": round(time.time() - start, 2),
+                  "frames_generated": len(frames),
+                  "video_bytes": os.path.getsize(video_path),
+                  "ffprobe": json.loads(probe),
+                  "peak_gpu_memory_gb": round(
+                      torch.cuda.max_memory_allocated() / 1024**3, 2
+                  ),
+                  "finished_utc": datetime.now(timezone.utc).isoformat()
+              })
+              save_receipt()
+              print("COGVIDEOX_VIDEO_TEST_RECEIPT")
+              print(json.dumps(receipt, indent=2))
+
+          except Exception as exc:
+              receipt.update({
+                  "status": "COGVIDEOX_GENERATION_FAILED",
+                  "error": repr(exc),
+                  "traceback": traceback.format_exc(),
+                  "finished_utc": datetime.now(timezone.utc).isoformat()
+              })
+              save_receipt()
+              print(json.dumps(receipt, indent=2))
+              raise
+          PY
+
+          kaggle kernels push -p kernel --accelerator NvidiaTeslaT4
+
+      - name: Wait for Kaggle video generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+          completed=false
+
+          for i in $(seq 1 360); do
+            echo "Kaggle video test status check $i/360"
+            status="$(kaggle kernels status "$KERNEL_ID" 2>&1)" || true
+            echo "$status"
+
+            if echo "$status" | grep -Eqi 'COMPLETE'; then
+              completed=true
+              break
+            fi
+
+            if echo "$status" | grep -Eqi 'ERROR|CANCEL'; then
+              echo "Kaggle execution failed; retrieving kernel logs."
+              mkdir -p output
+              kaggle kernels logs "$KERNEL_ID" > output/kaggle-video-kernel.log 2>&1 || true
+              cat output/kaggle-video-kernel.log
+              exit 1
+            fi
+            sleep 30
+          done
+
+          if [ "$completed" != "true" ]; then
+            echo "Timed out waiting for Kaggle video generation."
+            mkdir -p output
+            kaggle kernels logs "$KERNEL_ID" > output/kaggle-video-kernel.log 2>&1 || true
+            exit 1
+          fi
+
+      - name: Retrieve video and receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          KERNEL_ID="${KAGGLE_USERNAME}/${KERNEL_SLUG}"
+          mkdir -p output
+          kaggle kernels output "$KERNEL_ID" -p output
+          test -s output/video_test_receipt.json
+          cat output/video_test_receipt.json
+          python - <<'PY'
+          import json
+          with open("output/video_test_receipt.json") as f:
+              data = json.load(f)
+          if data.get("status") != "COGVIDEOX_GENERATION_SUCCESS":
+              raise SystemExit(
+                  "Video generation failed: " + str(data.get("status"))
+              )
+          PY
+
+      - name: Upload video, receipt, and diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-cogvideox-robot-video
+          path: |
+            output/cogvideox_robot_smoke_test.mp4
+            output/video_test_receipt.json
+            output/kaggle-video-kernel.log
+          if-no-files-found: ignore
+          retention-days: 14
+          
