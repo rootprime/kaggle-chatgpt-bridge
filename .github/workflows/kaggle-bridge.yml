@@ -32,14 +32,14 @@ jobs:
           echo "Kaggle credentials are present."
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Install Kaggle CLI
         run: |
           python -m pip install --upgrade pip
-          python -m pip install kaggle
+          python -m pip install kaggle six
 
       - name: Configure Kaggle authentication
         shell: bash
@@ -73,9 +73,9 @@ jobs:
               "code_file": "main.py",
               "language": "python",
               "kernel_type": "script",
-              "is_private": "true",
-              "enable_gpu": "false",
-              "enable_internet": "false",
+              "is_private": True,
+              "enable_gpu": False,
+              "enable_internet": False,
               "dataset_sources": [],
               "competition_sources": [],
               "kernel_sources": [],
